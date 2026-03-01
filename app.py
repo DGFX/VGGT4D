@@ -1,6 +1,23 @@
 import os
 import tempfile
 
+# ---------------------------------------------------------------------------
+# Workaround for Gradio/pydantic bool-schema bug
+# (https://github.com/gradio-app/gradio/issues/11722)
+# Must run BEFORE importing gradio.
+# ---------------------------------------------------------------------------
+import gradio_client.utils as _gcu
+
+_orig_get_type = _gcu.get_type
+
+def _patched_get_type(schema):
+    if isinstance(schema, bool):
+        return "bool"
+    return _orig_get_type(schema)
+
+_gcu.get_type = _patched_get_type
+# ---------------------------------------------------------------------------
+
 import cv2
 import gradio as gr
 import matplotlib
@@ -111,24 +128,21 @@ def images_to_video(frames: list[np.ndarray], fps: int = 8) -> str:
 # ---------------------------------------------------------------------------
 
 @spaces.GPU(duration=180)
-def run_pipeline(video_path: str, progress=gr.Progress(track_tqdm=True)):
+def run_pipeline(video_path):
     if video_path is None:
         raise gr.Error("Please upload a video.")
 
     device = torch.device("cuda")
 
     # --- Extract frames ---
-    progress(0, desc="Extracting frames...")
     frame_paths = extract_frames(video_path)
     n_frames = len(frame_paths)
 
     # --- Preprocess ---
-    progress(0.05, desc=f"Preprocessing {n_frames} frames...")
     images = load_and_preprocess_images(frame_paths).to(device)
     n_img, _, h_img, w_img = images.shape
 
     # --- Stage 1: depth + dynamic map ---
-    progress(0.10, desc="Stage 1: Predicting depth and dynamic map...")
     predictions1, qk_dict, enc_feat, agg_tokens_list = inference(model, images)
     del agg_tokens_list
     qk_dict = organize_qk_dict(qk_dict, n_img)
@@ -157,7 +171,6 @@ def run_pipeline(video_path: str, progress=gr.Progress(track_tqdm=True)):
     del upsampled_map
 
     # --- Stage 2: refine extrinsics ---
-    progress(0.45, desc="Stage 2: Refining camera poses...")
     torch.cuda.empty_cache()
     predictions2, _, _, _ = inference(model, images, dyn_masks.to(device))
 
@@ -167,7 +180,6 @@ def run_pipeline(video_path: str, progress=gr.Progress(track_tqdm=True)):
     del predictions1, predictions2
 
     # --- Stage 3: refine dynamic masks ---
-    progress(0.70, desc="Stage 3: Refining dynamic masks...")
     torch.cuda.empty_cache()
 
     pred_depths = final_prediction["depth"]
@@ -187,7 +199,6 @@ def run_pipeline(video_path: str, progress=gr.Progress(track_tqdm=True)):
     torch.cuda.empty_cache()
 
     # --- Build visualisations ---
-    progress(0.90, desc="Building visualisations...")
     imgs_np = (
         images.cpu().permute(0, 2, 3, 1).numpy() * 255
     ).astype(np.uint8)  # (N, H, W, 3)
@@ -208,7 +219,6 @@ def run_pipeline(video_path: str, progress=gr.Progress(track_tqdm=True)):
         gallery_items.append((depth_frames[i], f"Depth {i}"))
         gallery_items.append((overlay_frames[i], f"Dynamic {i}"))
 
-    progress(1.0, desc="Done!")
     return depth_video, mask_video, gallery_items
 
 
