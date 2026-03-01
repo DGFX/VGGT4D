@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 
 # ---------------------------------------------------------------------------
@@ -36,7 +37,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from huggingface_hub import hf_hub_download
 
-import sys
 print("[VGGT4D] Importing modules...", flush=True)
 try:
     from vggt4d.masks.dynamic_mask import (
@@ -44,13 +44,9 @@ try:
         cluster_attention_maps,
         extract_dyn_map,
     )
-    print("[VGGT4D] dynamic_mask OK", flush=True)
     from vggt4d.masks.refine_dyn_mask import RefineDynMask
-    print("[VGGT4D] refine_dyn_mask OK", flush=True)
     from vggt4d.models.vggt4d import VGGTFor4D
-    print("[VGGT4D] VGGTFor4D OK", flush=True)
     from vggt4d.utils.model_utils import inference, organize_qk_dict
-    print("[VGGT4D] model_utils OK", flush=True)
     from vggt.utils.load_fn import load_and_preprocess_images
     print("[VGGT4D] All imports OK", flush=True)
 except Exception as e:
@@ -60,8 +56,8 @@ except Exception as e:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Model loading — ZeroGPU intercepts .cuda()/.to('cuda') at module level
-# and keeps weights on CPU until a @spaces.GPU function runs.
+# Model loading — keep on CPU at module level.
+# ZeroGPU only provides a GPU inside @spaces.GPU functions.
 # ---------------------------------------------------------------------------
 LOCAL_CKPT = "./ckpts/model_tracker_fixed_e20.pt"
 CKPT_REPO = "facebook/VGGT_tracker_fixed"
@@ -78,8 +74,9 @@ try:
     model = VGGTFor4D()
     model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location="cpu"))
     model.eval()
-    model.cuda()
-    print("[VGGT4D] Model loaded", flush=True)
+    # NOTE: Do NOT call model.cuda() here — ZeroGPU only grants GPU inside
+    # @spaces.GPU decorated functions. We move it there.
+    print("[VGGT4D] Model loaded on CPU", flush=True)
 except Exception as e:
     print(f"[VGGT4D] MODEL LOAD ERROR: {e}", flush=True)
     import traceback
@@ -100,7 +97,6 @@ def extract_frames(video_path: str, max_frames: int = MAX_FRAMES) -> list[str]:
         cap.release()
         raise gr.Error("Could not read video.")
 
-    # Subsample if too many frames
     step = max(1, total // max_frames)
     tmpdir = tempfile.mkdtemp()
     paths = []
@@ -164,9 +160,11 @@ def run_pipeline(video_path):
 
     device = torch.device("cuda")
 
+    # Move model to GPU (ZeroGPU grants GPU access here)
+    model.to(device)
+
     # --- Extract frames ---
     frame_paths = extract_frames(video_path)
-    n_frames = len(frame_paths)
 
     # --- Preprocess ---
     images = load_and_preprocess_images(frame_paths).to(device)
@@ -231,9 +229,9 @@ def run_pipeline(video_path):
     # --- Build visualisations ---
     imgs_np = (
         images.cpu().permute(0, 2, 3, 1).numpy() * 255
-    ).astype(np.uint8)  # (N, H, W, 3)
-    masks_np = refined_mask.cpu().numpy().astype(bool)  # (N, H, W)
-    depths_np = pred_depths  # (N, H, W)
+    ).astype(np.uint8)
+    masks_np = refined_mask.cpu().numpy().astype(bool)
+    depths_np = pred_depths
 
     depth_frames = [depth_to_colormap(depths_np[i]) for i in range(n_img)]
     overlay_frames = [mask_overlay(imgs_np[i], masks_np[i]) for i in range(n_img)]
@@ -241,7 +239,6 @@ def run_pipeline(video_path):
     depth_video = images_to_video(depth_frames)
     mask_video = images_to_video(overlay_frames)
 
-    # Gallery images: interleaved input / depth / mask for first 8 frames
     gallery_items = []
     step = max(1, n_img // 8)
     for i in range(0, n_img, step):
