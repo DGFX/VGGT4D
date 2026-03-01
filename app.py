@@ -6,16 +6,24 @@ import tempfile
 # (https://github.com/gradio-app/gradio/issues/11722)
 # Must run BEFORE importing gradio.
 # ---------------------------------------------------------------------------
-import gradio_client.utils as _gcu
-
-_orig_get_type = _gcu.get_type
-
-def _patched_get_type(schema):
-    if isinstance(schema, bool):
-        return "bool"
-    return _orig_get_type(schema)
-
-_gcu.get_type = _patched_get_type
+try:
+    import gradio_client.utils as _gcu
+    if hasattr(_gcu, "get_type"):
+        _orig_get_type = _gcu.get_type
+        def _patched_get_type(schema):
+            if isinstance(schema, bool):
+                return "bool"
+            return _orig_get_type(schema)
+        _gcu.get_type = _patched_get_type
+    elif hasattr(_gcu, "_json_schema_to_python_type"):
+        _orig_json_schema = _gcu._json_schema_to_python_type
+        def _patched_json_schema(schema, defs=None):
+            if isinstance(schema, bool):
+                return "bool"
+            return _orig_json_schema(schema, defs) if defs is not None else _orig_json_schema(schema)
+        _gcu._json_schema_to_python_type = _patched_json_schema
+except Exception:
+    pass
 # ---------------------------------------------------------------------------
 
 import cv2
@@ -28,15 +36,28 @@ import torch.nn.functional as F
 from einops import rearrange
 from huggingface_hub import hf_hub_download
 
-from vggt4d.masks.dynamic_mask import (
-    adaptive_multiotsu_variance,
-    cluster_attention_maps,
-    extract_dyn_map,
-)
-from vggt4d.masks.refine_dyn_mask import RefineDynMask
-from vggt4d.models.vggt4d import VGGTFor4D
-from vggt4d.utils.model_utils import inference, organize_qk_dict
-from vggt.utils.load_fn import load_and_preprocess_images
+import sys
+print("[VGGT4D] Importing modules...", flush=True)
+try:
+    from vggt4d.masks.dynamic_mask import (
+        adaptive_multiotsu_variance,
+        cluster_attention_maps,
+        extract_dyn_map,
+    )
+    print("[VGGT4D] dynamic_mask OK", flush=True)
+    from vggt4d.masks.refine_dyn_mask import RefineDynMask
+    print("[VGGT4D] refine_dyn_mask OK", flush=True)
+    from vggt4d.models.vggt4d import VGGTFor4D
+    print("[VGGT4D] VGGTFor4D OK", flush=True)
+    from vggt4d.utils.model_utils import inference, organize_qk_dict
+    print("[VGGT4D] model_utils OK", flush=True)
+    from vggt.utils.load_fn import load_and_preprocess_images
+    print("[VGGT4D] All imports OK", flush=True)
+except Exception as e:
+    print(f"[VGGT4D] IMPORT ERROR: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Model loading — ZeroGPU intercepts .cuda()/.to('cuda') at module level
@@ -46,15 +67,24 @@ LOCAL_CKPT = "./ckpts/model_tracker_fixed_e20.pt"
 CKPT_REPO = "facebook/VGGT_tracker_fixed"
 CKPT_FILENAME = "model_tracker_fixed_e20.pt"
 
-if os.path.exists(LOCAL_CKPT):
-    ckpt_path = LOCAL_CKPT
-else:
-    ckpt_path = hf_hub_download(repo_id=CKPT_REPO, filename=CKPT_FILENAME)
+print("[VGGT4D] Loading checkpoint...", flush=True)
+try:
+    if os.path.exists(LOCAL_CKPT):
+        ckpt_path = LOCAL_CKPT
+    else:
+        ckpt_path = hf_hub_download(repo_id=CKPT_REPO, filename=CKPT_FILENAME)
+    print(f"[VGGT4D] Checkpoint: {ckpt_path}", flush=True)
 
-model = VGGTFor4D()
-model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location="cpu"))
-model.eval()
-model.cuda()
+    model = VGGTFor4D()
+    model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location="cpu"))
+    model.eval()
+    model.cuda()
+    print("[VGGT4D] Model loaded", flush=True)
+except Exception as e:
+    print(f"[VGGT4D] MODEL LOAD ERROR: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
 MAX_FRAMES = 50
 
