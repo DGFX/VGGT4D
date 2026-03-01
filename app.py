@@ -56,8 +56,7 @@ except Exception as e:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Model loading — keep on CPU at module level.
-# ZeroGPU only provides a GPU inside @spaces.GPU functions.
+# Model loading — keep on CPU, ZeroGPU provides GPU only inside @spaces.GPU.
 # ---------------------------------------------------------------------------
 LOCAL_CKPT = "./ckpts/model_tracker_fixed_e20.pt"
 CKPT_REPO = "facebook/VGGT_tracker_fixed"
@@ -74,8 +73,6 @@ try:
     model = VGGTFor4D()
     model.load_state_dict(torch.load(ckpt_path, weights_only=True, map_location="cpu"))
     model.eval()
-    # NOTE: Do NOT call model.cuda() here — ZeroGPU only grants GPU inside
-    # @spaces.GPU decorated functions. We move it there.
     print("[VGGT4D] Model loaded on CPU", flush=True)
 except Exception as e:
     print(f"[VGGT4D] MODEL LOAD ERROR: {e}", flush=True)
@@ -83,7 +80,7 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-MAX_FRAMES = 50
+MAX_FRAMES = 20
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -150,27 +147,19 @@ def images_to_video(frames: list[np.ndarray], fps: int = 8) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Pipeline stages — split into separate @spaces.GPU calls so each fits
+# within ZeroGPU's time budget.
 # ---------------------------------------------------------------------------
 
-@spaces.GPU(duration=180)
-def run_pipeline(video_path):
-    if video_path is None:
-        raise gr.Error("Please upload a video.")
-
+@spaces.GPU(duration=120)
+def run_stage1(frame_paths):
+    """Stage 1: predict depth and extract coarse dynamic map."""
     device = torch.device("cuda")
-
-    # Move model to GPU (ZeroGPU grants GPU access here)
     model.to(device)
 
-    # --- Extract frames ---
-    frame_paths = extract_frames(video_path)
-
-    # --- Preprocess ---
     images = load_and_preprocess_images(frame_paths).to(device)
     n_img, _, h_img, w_img = images.shape
 
-    # --- Stage 1: depth + dynamic map ---
     predictions1, qk_dict, enc_feat, agg_tokens_list = inference(model, images)
     del agg_tokens_list
     qk_dict = organize_qk_dict(qk_dict, n_img)
@@ -195,42 +184,110 @@ def run_pipeline(video_path):
     del norm_dyn_map
 
     thres = adaptive_multiotsu_variance(upsampled_map.cpu().numpy())
-    dyn_masks = upsampled_map > thres
+    dyn_masks = (upsampled_map > thres).cpu()
     del upsampled_map
 
-    # --- Stage 2: refine extrinsics ---
+    # Move results to CPU before GPU is released
+    predictions1_cpu = {}
+    for k, v in predictions1.items():
+        if isinstance(v, np.ndarray):
+            predictions1_cpu[k] = v
+        elif isinstance(v, torch.Tensor):
+            predictions1_cpu[k] = v.cpu()
+        else:
+            predictions1_cpu[k] = v
+
+    images_cpu = images.cpu()
+    del images
     torch.cuda.empty_cache()
+
+    return images_cpu, predictions1_cpu, dyn_masks
+
+
+@spaces.GPU(duration=120)
+def run_stage2(images_cpu, dyn_masks):
+    """Stage 2: re-run inference with dynamic masks to refine camera poses."""
+    device = torch.device("cuda")
+    model.to(device)
+
+    images = images_cpu.to(device)
     predictions2, _, _, _ = inference(model, images, dyn_masks.to(device))
 
-    final_prediction = {**predictions1}
-    final_prediction["extrinsic"] = predictions2["extrinsic"]
-    final_prediction["cam2world"] = predictions2["cam2world"]
-    del predictions1, predictions2
+    predictions2_cpu = {}
+    for k, v in predictions2.items():
+        if isinstance(v, np.ndarray):
+            predictions2_cpu[k] = v
+        elif isinstance(v, torch.Tensor):
+            predictions2_cpu[k] = v.cpu()
+        else:
+            predictions2_cpu[k] = v
 
-    # --- Stage 3: refine dynamic masks ---
+    del images
     torch.cuda.empty_cache()
 
-    pred_depths = final_prediction["depth"]
-    pred_cam2world = final_prediction["cam2world"]
-    pred_intrinsic = final_prediction["intrinsic"]
+    return predictions2_cpu
+
+
+@spaces.GPU(duration=120)
+def run_stage3(images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsic):
+    """Stage 3: refine dynamic masks via geometric reprojection."""
+    device = torch.device("cuda")
 
     refiner = RefineDynMask(
-        images,
+        images_cpu.to(device),
         torch.tensor(pred_depths).to(device),
         dyn_masks.to(device),
         torch.tensor(pred_cam2world).float().to(device),
         torch.tensor(pred_intrinsic).to(device),
         device,
     )
-    refined_mask = refiner.refine_masks()
+    refined_mask = refiner.refine_masks().cpu()
     del refiner
     torch.cuda.empty_cache()
 
-    # --- Build visualisations ---
+    return refined_mask
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator (runs on CPU, dispatches GPU stages)
+# ---------------------------------------------------------------------------
+
+def run_pipeline(video_path, enable_refinement):
+    if video_path is None:
+        raise gr.Error("Please upload a video.")
+
+    # --- Extract frames (CPU) ---
+    frame_paths = extract_frames(video_path)
+
+    # --- Stage 1 (GPU) ---
+    images_cpu, predictions1, dyn_masks = run_stage1(frame_paths)
+    n_img = images_cpu.shape[0]
+    h_img, w_img = images_cpu.shape[2], images_cpu.shape[3]
+
+    # --- Stage 2 (GPU) ---
+    predictions2 = run_stage2(images_cpu, dyn_masks)
+
+    final_prediction = {**predictions1}
+    final_prediction["extrinsic"] = predictions2["extrinsic"]
+    final_prediction["cam2world"] = predictions2["cam2world"]
+
+    pred_depths = final_prediction["depth"]
+    pred_cam2world = final_prediction["cam2world"]
+    pred_intrinsic = final_prediction["intrinsic"]
+
+    # --- Stage 3 (GPU, optional) ---
+    if enable_refinement:
+        refined_mask = run_stage3(
+            images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsic
+        )
+        masks_np = refined_mask.numpy().astype(bool)
+    else:
+        masks_np = dyn_masks.numpy().astype(bool)
+
+    # --- Build visualisations (CPU) ---
     imgs_np = (
-        images.cpu().permute(0, 2, 3, 1).numpy() * 255
+        images_cpu.permute(0, 2, 3, 1).numpy() * 255
     ).astype(np.uint8)
-    masks_np = refined_mask.cpu().numpy().astype(bool)
     depths_np = pred_depths
 
     depth_frames = [depth_to_colormap(depths_np[i]) for i in range(n_img)]
@@ -266,17 +323,22 @@ with gr.Blocks(css=css, title="VGGT4D") as demo:
         The pipeline runs three stages:
         1. Predict depth and initial dynamic map from attention patterns
         2. Re-estimate camera poses masking dynamic regions
-        3. Refine dynamic masks via geometric consistency
+        3. *(Optional)* Refine dynamic masks via geometric consistency
         """
     )
 
     with gr.Row():
         with gr.Column(scale=1):
             video_input = gr.Video(label="Input Video")
+            enable_stage3 = gr.Checkbox(
+                label="Enable mask refinement (Stage 3)",
+                value=False,
+                info="Slower but more accurate dynamic masks. Disable to stay within GPU time limits.",
+            )
             run_btn = gr.Button("Run VGGT4D", variant="primary")
             gr.Markdown(
-                f"*Frames are subsampled to at most **{MAX_FRAMES}** for memory. "
-                "Short clips (2-10 s) work best.*"
+                f"*Frames are subsampled to at most **{MAX_FRAMES}**. "
+                "Short clips (2-5 s) work best.*"
             )
 
         with gr.Column(scale=2):
@@ -294,7 +356,7 @@ with gr.Blocks(css=css, title="VGGT4D") as demo:
 
     run_btn.click(
         fn=run_pipeline,
-        inputs=[video_input],
+        inputs=[video_input, enable_stage3],
         outputs=[depth_out, mask_out, gallery_out],
     )
 
