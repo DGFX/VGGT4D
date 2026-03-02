@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 
 # ---------------------------------------------------------------------------
 # Workaround for Gradio/pydantic bool-schema bug
@@ -80,7 +81,7 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-MAX_FRAMES = 20
+MAX_FRAMES = 12
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -146,6 +147,14 @@ def images_to_video(frames: list[np.ndarray], fps: int = 8) -> str:
     return tmp.name
 
 
+def pick_prediction_keys(predictions: dict, keys: tuple[str, ...]) -> dict:
+    """Select only required prediction fields to minimize ZeroGPU payload size."""
+    missing = [k for k in keys if k not in predictions]
+    if missing:
+        raise gr.Error(f"Model output missing required keys: {', '.join(missing)}")
+    return {k: predictions[k] for k in keys}
+
+
 # ---------------------------------------------------------------------------
 # Pipeline stages — split into separate @spaces.GPU calls so each fits
 # within ZeroGPU's time budget.
@@ -154,6 +163,8 @@ def images_to_video(frames: list[np.ndarray], fps: int = 8) -> str:
 @spaces.GPU(duration=120)
 def run_stage1(frame_paths):
     """Stage 1: predict depth and extract coarse dynamic map."""
+    t0 = time.time()
+    print(f"[VGGT4D] Stage 1 start - frames={len(frame_paths)}", flush=True)
     device = torch.device("cuda")
     model.to(device)
 
@@ -187,50 +198,48 @@ def run_stage1(frame_paths):
     dyn_masks = (upsampled_map > thres).cpu()
     del upsampled_map
 
-    # Move results to CPU before GPU is released
-    predictions1_cpu = {}
-    for k, v in predictions1.items():
-        if isinstance(v, np.ndarray):
-            predictions1_cpu[k] = v
-        elif isinstance(v, torch.Tensor):
-            predictions1_cpu[k] = v.cpu()
-        else:
-            predictions1_cpu[k] = v
+    stage1_predictions = pick_prediction_keys(
+        predictions1, ("depth", "intrinsic")
+    )
 
     images_cpu = images.cpu()
     del images
     torch.cuda.empty_cache()
 
-    return images_cpu, predictions1_cpu, dyn_masks
+    dt = time.time() - t0
+    print(f"[VGGT4D] Stage 1 done in {dt:.2f}s", flush=True)
+
+    return images_cpu, stage1_predictions, dyn_masks
 
 
 @spaces.GPU(duration=120)
 def run_stage2(images_cpu, dyn_masks):
     """Stage 2: re-run inference with dynamic masks to refine camera poses."""
+    t0 = time.time()
+    print("[VGGT4D] Stage 2 start", flush=True)
     device = torch.device("cuda")
     model.to(device)
 
     images = images_cpu.to(device)
     predictions2, _, _, _ = inference(model, images, dyn_masks.to(device))
-
-    predictions2_cpu = {}
-    for k, v in predictions2.items():
-        if isinstance(v, np.ndarray):
-            predictions2_cpu[k] = v
-        elif isinstance(v, torch.Tensor):
-            predictions2_cpu[k] = v.cpu()
-        else:
-            predictions2_cpu[k] = v
+    stage2_predictions = pick_prediction_keys(
+        predictions2, ("extrinsic", "cam2world")
+    )
 
     del images
     torch.cuda.empty_cache()
 
-    return predictions2_cpu
+    dt = time.time() - t0
+    print(f"[VGGT4D] Stage 2 done in {dt:.2f}s", flush=True)
+
+    return stage2_predictions
 
 
 @spaces.GPU(duration=120)
 def run_stage3(images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsic):
     """Stage 3: refine dynamic masks via geometric reprojection."""
+    t0 = time.time()
+    print("[VGGT4D] Stage 3 start", flush=True)
     device = torch.device("cuda")
 
     refiner = RefineDynMask(
@@ -245,6 +254,9 @@ def run_stage3(images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsi
     del refiner
     torch.cuda.empty_cache()
 
+    dt = time.time() - t0
+    print(f"[VGGT4D] Stage 3 done in {dt:.2f}s", flush=True)
+
     return refined_mask
 
 
@@ -253,34 +265,56 @@ def run_stage3(images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsi
 # ---------------------------------------------------------------------------
 
 def run_pipeline(video_path, enable_refinement):
+    pipeline_t0 = time.time()
     if video_path is None:
         raise gr.Error("Please upload a video.")
 
     # --- Extract frames (CPU) ---
     frame_paths = extract_frames(video_path)
+    print(f"[VGGT4D] Extracted {len(frame_paths)} frames", flush=True)
 
     # --- Stage 1 (GPU) ---
-    images_cpu, predictions1, dyn_masks = run_stage1(frame_paths)
+    try:
+        images_cpu, stage1_predictions, dyn_masks = run_stage1(frame_paths)
+    except Exception as e:
+        raise gr.Error(
+            f"Stage 1 failed ({type(e).__name__}). "
+            "Possible cause: ZeroGPU timeout/OOM/payload issue. "
+            "Try a shorter clip."
+        ) from e
+
     n_img = images_cpu.shape[0]
     h_img, w_img = images_cpu.shape[2], images_cpu.shape[3]
+    print(f"[VGGT4D] Resolution after preprocessing: {h_img}x{w_img}", flush=True)
 
     # --- Stage 2 (GPU) ---
-    predictions2 = run_stage2(images_cpu, dyn_masks)
+    try:
+        stage2_predictions = run_stage2(images_cpu, dyn_masks)
+    except Exception as e:
+        raise gr.Error(
+            f"Stage 2 failed ({type(e).__name__}). "
+            "Possible cause: ZeroGPU timeout/OOM/payload issue. "
+            "Try a shorter clip or disable refinement."
+        ) from e
 
-    final_prediction = {**predictions1}
-    final_prediction["extrinsic"] = predictions2["extrinsic"]
-    final_prediction["cam2world"] = predictions2["cam2world"]
-
-    pred_depths = final_prediction["depth"]
-    pred_cam2world = final_prediction["cam2world"]
-    pred_intrinsic = final_prediction["intrinsic"]
+    pred_depths = stage1_predictions["depth"]
+    pred_cam2world = stage2_predictions["cam2world"]
+    pred_intrinsic = stage1_predictions["intrinsic"]
 
     # --- Stage 3 (GPU, optional) ---
     if enable_refinement:
-        refined_mask = run_stage3(
-            images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsic
-        )
-        masks_np = refined_mask.numpy().astype(bool)
+        try:
+            refined_mask = run_stage3(
+                images_cpu, dyn_masks, pred_depths, pred_cam2world, pred_intrinsic
+            )
+            masks_np = refined_mask.numpy().astype(bool)
+        except Exception as e:
+            print(
+                f"[VGGT4D] Stage 3 failed ({type(e).__name__}): {e}. "
+                "Falling back to coarse dynamic masks.",
+                flush=True,
+            )
+            masks_np = dyn_masks.numpy().astype(bool)
     else:
         masks_np = dyn_masks.numpy().astype(bool)
 
@@ -303,6 +337,8 @@ def run_pipeline(video_path, enable_refinement):
         gallery_items.append((depth_frames[i], f"Depth {i}"))
         gallery_items.append((overlay_frames[i], f"Dynamic {i}"))
 
+    total_dt = time.time() - pipeline_t0
+    print(f"[VGGT4D] Pipeline done in {total_dt:.2f}s", flush=True)
     return depth_video, mask_video, gallery_items
 
 
@@ -338,7 +374,7 @@ with gr.Blocks(css=css, title="VGGT4D") as demo:
             run_btn = gr.Button("Run VGGT4D", variant="primary")
             gr.Markdown(
                 f"*Frames are subsampled to at most **{MAX_FRAMES}**. "
-                "Short clips (2-5 s) work best.*"
+                "Short clips (2-5 s) work best to avoid ZeroGPU timeout.*"
             )
 
         with gr.Column(scale=2):
